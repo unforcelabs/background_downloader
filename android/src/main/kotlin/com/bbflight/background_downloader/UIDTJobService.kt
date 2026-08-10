@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.PersistableBundle
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -15,7 +16,13 @@ import kotlinx.serialization.json.Json
 
 class UIDTJobService : JobService() {
 
-    private val jobs = java.util.concurrent.ConcurrentHashMap<Int, Job>()
+    private data class RunningJob(
+        val coroutine: Job,
+        val context: UIDTJobContext,
+        val runner: TaskRunner
+    )
+
+    private val jobs = java.util.concurrent.ConcurrentHashMap<Int, RunningJob>()
 
     override fun onStartJob(params: JobParameters?): Boolean {
         Log.d(TaskRunner.TAG, "Starting UIDT JobService")
@@ -55,23 +62,36 @@ class UIDTJobService : JobService() {
             }
         }
 
-        val job = CoroutineScope(Dispatchers.IO).launch {
-            runner.run()
-            Log.d(TaskRunner.TAG, "UIDT JobService finished for taskId ${jobContext.task.taskId}")
-            jobs.remove(params.jobId)
-            jobFinished(params, false) // Needs reschedule? usually false for these tasks as we manage retries internally
+        lateinit var runningJob: RunningJob
+        val job = CoroutineScope(Dispatchers.IO).launch(start = CoroutineStart.LAZY) {
+            try {
+                runner.run()
+                Log.d(TaskRunner.TAG, "UIDT JobService finished for taskId ${jobContext.task.taskId}")
+            } finally {
+                jobs.remove(params.jobId, runningJob)
+                // onStopJob's return value exclusively controls system rescheduling.
+                if (!jobContext.systemStopped) {
+                    jobFinished(params, false)
+                }
+            }
         }
-        jobs[params.jobId] = job
+        runningJob = RunningJob(job, jobContext, runner)
+        jobs[params.jobId] = runningJob
+        job.start()
 
         return true // Work is still running on background thread
     }
 
     override fun onStopJob(params: JobParameters?): Boolean {
         Log.i(TaskRunner.TAG, "Stopping UIDT JobService")
-        if (params != null) {
-            jobs.remove(params.jobId)?.cancel()
-        }
-        return true // Reschedule? If system stopped it, maybe we want to retry?
+        if (params == null) return true
+        val runningJob = jobs.remove(params.jobId)
+        val taskId = runningJob?.context?.task?.taskId
+        val wasCanceledByApp = taskId != null && BDPlugin.canceledTaskIds.contains(taskId)
+        runningJob?.context?.markSystemStopped()
+        runningJob?.runner?.activeConnection?.disconnect()
+        runningJob?.coroutine?.cancel()
+        return !wasCanceledByApp
     }
 
     /**
@@ -91,19 +111,21 @@ class UIDTJobService : JobService() {
         override val appContext: Context
             get() = service.applicationContext
 
+        @Volatile
+        var systemStopped = false
+
+        fun markSystemStopped() {
+            systemStopped = true
+        }
+
         override val isTaskStopped: Boolean
-            get() = !isActive // Simple check if job is active
+            get() = systemStopped
+
+        override val deferStoppedTaskToScheduler: Boolean
+            get() = systemStopped
 
         override val isActive: Boolean
-            get() {
-                 // ideally we check if the specific job is still active, but we don't have easy access
-                 // to the job object here without circular dependency or passing it in later.
-                 // However, onStopJob cancels the coroutine, so the check in TaskRunner via isActive
-                 // (CoroutineScope) should handle it.
-                 // TaskJobContext.isActive is used for some checks.
-                 // For now, return true, relying on coroutine cancellation to stop the runner's loop.
-                 return true
-            }
+            get() = !systemStopped
 
 
         override fun getInputLong(key: String, defaultValue: Long): Long {

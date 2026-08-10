@@ -194,6 +194,15 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     .setRequiredNetworkType(if (taskRequiresWifi) JobInfo.NETWORK_TYPE_UNMETERED else JobInfo.NETWORK_TYPE_ANY)
                     .setRequiresCharging(false)
                     .setExtras(extras)
+
+                if (task.isUploadTask()) {
+                    task.headers.entries
+                        .firstOrNull { it.key.equals("content-length", ignoreCase = true) }
+                        ?.value
+                        ?.toLongOrNull()
+                        ?.takeIf { it > 0 }
+                        ?.let { jobInfoBuilder.setEstimatedNetworkBytes(0, it) }
+                }
                 
                 if (initialDelayMillis > 0) {
                     jobInfoBuilder.setMinimumLatency(initialDelayMillis)

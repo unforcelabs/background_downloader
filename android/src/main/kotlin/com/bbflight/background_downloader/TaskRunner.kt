@@ -53,6 +53,10 @@ interface TaskJobContext {
     var notificationConfigJsonString: String?
     val isTaskStopped: Boolean
 
+    /** True when JobScheduler owns retry after stopping a UIDT. */
+    val deferStoppedTaskToScheduler: Boolean
+        get() = false
+
     // Foreground control
     var runInForeground: Boolean
     val isActive: Boolean // maps to !isStopped or Service state
@@ -529,7 +533,7 @@ open class TaskRunner(
                 }
                 setTaskException(e)
             } finally {
-                withContext(NonCancellable) {
+                if (!context.deferStoppedTaskToScheduler) withContext(NonCancellable) {
                     // NonCancellable to make sure we clean up even if job is being cancelled
                     processStatusUpdate(
                         task,
