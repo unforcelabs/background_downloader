@@ -190,6 +190,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 }
                 
                 val jobInfoBuilder = JobInfo.Builder(task.taskId.hashCode(), componentName)
+                    .setUserInitiated(true)
                     .setRequiredNetworkType(if (taskRequiresWifi) JobInfo.NETWORK_TYPE_UNMETERED else JobInfo.NETWORK_TYPE_ANY)
                     .setRequiresCharging(false)
                     .setExtras(extras)
