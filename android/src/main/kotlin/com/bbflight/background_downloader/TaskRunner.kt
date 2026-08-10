@@ -53,9 +53,12 @@ interface TaskJobContext {
     var notificationConfigJsonString: String?
     val isTaskStopped: Boolean
 
-    /** True when JobScheduler owns retry after stopping a UIDT. */
-    val deferStoppedTaskToScheduler: Boolean
-        get() = false
+    /** Claims terminal bookkeeping before a scheduler can stop the task. */
+    fun claimTaskFinalization(): Boolean = true
+
+    /** WorkManager must finish bookkeeping after cancellation; UIDT must stop. */
+    val finalizeAfterCancellation: Boolean
+        get() = true
 
     // Foreground control
     var runInForeground: Boolean
@@ -486,17 +489,19 @@ open class TaskRunner(
                         TAG,
                         "TaskId ${task.taskId} interrupted by beforeTaskStart callback"
                     )
-                    processStatusUpdate(
-                        task,
-                        statusUpdate.taskStatus,
-                        prefs,
-                        taskException = statusUpdate.exception,
-                        responseBody = statusUpdate.responseBody,
-                        responseHeaders = statusUpdate.responseHeaders,
-                        responseStatusCode = statusUpdate.responseStatusCode,
-                        context = context.appContext
-                    )
-                    BDPlugin.holdingQueue?.taskFinished(task)
+                    finalizeTask {
+                        processStatusUpdate(
+                            task,
+                            statusUpdate.taskStatus,
+                            prefs,
+                            taskException = statusUpdate.exception,
+                            responseBody = statusUpdate.responseBody,
+                            responseHeaders = statusUpdate.responseHeaders,
+                            responseStatusCode = statusUpdate.responseStatusCode,
+                            context = context.appContext
+                        )
+                        BDPlugin.holdingQueue?.taskFinished(task)
+                    }
                     return@withContext // task interrupted
                 }
             }
@@ -533,8 +538,7 @@ open class TaskRunner(
                 }
                 setTaskException(e)
             } finally {
-                if (!context.deferStoppedTaskToScheduler) withContext(NonCancellable) {
-                    // NonCancellable to make sure we clean up even if job is being cancelled
+                finalizeTask {
                     processStatusUpdate(
                         task,
                         status,
@@ -560,6 +564,15 @@ open class TaskRunner(
             }
         }
         hasDeliveredResult = true
+    }
+
+    private suspend fun finalizeTask(action: suspend () -> Unit) {
+        if (!context.claimTaskFinalization()) return
+        if (context.finalizeAfterCancellation) {
+            withContext(NonCancellable) { action() }
+        } else {
+            action()
+        }
     }
 
     /** Return true if resume is possible - defaults to false */

@@ -11,8 +11,49 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+
+internal enum class UIDTRunStateValue { RUNNING, FINALIZING, FINISHED, STOPPED }
+
+internal fun shouldRescheduleUIDT(
+    previous: UIDTRunStateValue,
+    canceledByApp: Boolean
+): Boolean = previous == UIDTRunStateValue.RUNNING && !canceledByApp
+
+internal class UIDTRunState {
+    private var value = UIDTRunStateValue.RUNNING
+
+    @Synchronized
+    fun claimFinalization(): Boolean {
+        if (value != UIDTRunStateValue.RUNNING) return false
+        value = UIDTRunStateValue.FINALIZING
+        return true
+    }
+
+    @Synchronized
+    fun finish(action: () -> Unit): Boolean {
+        if (value != UIDTRunStateValue.FINALIZING) return false
+        value = UIDTRunStateValue.FINISHED
+        action()
+        return true
+    }
+
+    @Synchronized
+    fun stop(): UIDTRunStateValue {
+        val previous = value
+        if (previous == UIDTRunStateValue.RUNNING ||
+            previous == UIDTRunStateValue.FINALIZING) {
+            value = UIDTRunStateValue.STOPPED
+        }
+        return previous
+    }
+
+    @Synchronized
+    fun isStopped(): Boolean = value == UIDTRunStateValue.STOPPED
+}
 
 class UIDTJobService : JobService() {
 
@@ -68,10 +109,15 @@ class UIDTJobService : JobService() {
                 runner.run()
                 Log.d(TaskRunner.TAG, "UIDT JobService finished for taskId ${jobContext.task.taskId}")
             } finally {
-                jobs.remove(params.jobId, runningJob)
-                // onStopJob's return value exclusively controls system rescheduling.
-                if (!jobContext.systemStopped) {
-                    jobFinished(params, false)
+                // JobService lifecycle callbacks run on main. Finish there too
+                // so completion and onStopJob cannot pass each other.
+                withContext(NonCancellable + Dispatchers.Main.immediate) {
+                    try {
+                        jobContext.claimTaskFinalization()
+                        jobContext.finishIfFinalizing { jobFinished(params, false) }
+                    } finally {
+                        jobs.remove(params.jobId, runningJob)
+                    }
                 }
             }
         }
@@ -85,13 +131,17 @@ class UIDTJobService : JobService() {
     override fun onStopJob(params: JobParameters?): Boolean {
         Log.i(TaskRunner.TAG, "Stopping UIDT JobService")
         if (params == null) return true
-        val runningJob = jobs.remove(params.jobId)
-        val taskId = runningJob?.context?.task?.taskId
-        val wasCanceledByApp = taskId != null && BDPlugin.canceledTaskIds.contains(taskId)
-        runningJob?.context?.markSystemStopped()
-        runningJob?.runner?.activeConnection?.disconnect()
-        runningJob?.coroutine?.cancel()
-        return !wasCanceledByApp
+        val runningJob = jobs[params.jobId] ?: return false
+        val priorState = runningJob.context.markStopped()
+        jobs.remove(params.jobId, runningJob)
+        val taskId = runningJob.context.task.taskId
+        val wasCanceledByApp = BDPlugin.canceledTaskIds.contains(taskId)
+        runningJob.runner.activeConnection?.disconnect()
+        runningJob.coroutine.cancel()
+        // Once terminal bookkeeping starts, the transfer has ended. The host
+        // app's durable journal repairs interrupted cleanup; rescheduling here
+        // could repeat a completed PUT.
+        return shouldRescheduleUIDT(priorState, wasCanceledByApp)
     }
 
     /**
@@ -107,25 +157,24 @@ class UIDTJobService : JobService() {
         override var taskCanResume: Boolean = false
         override var notificationConfigJsonString: String? = null
         override var runInForeground: Boolean = true // UIDT always runs in foreground service
+        override val finalizeAfterCancellation: Boolean = false
 
         override val appContext: Context
             get() = service.applicationContext
 
-        @Volatile
-        var systemStopped = false
+        private val runState = UIDTRunState()
 
-        fun markSystemStopped() {
-            systemStopped = true
-        }
+        override fun claimTaskFinalization(): Boolean = runState.claimFinalization()
+
+        internal fun finishIfFinalizing(action: () -> Unit): Boolean = runState.finish(action)
+
+        internal fun markStopped(): UIDTRunStateValue = runState.stop()
 
         override val isTaskStopped: Boolean
-            get() = systemStopped
-
-        override val deferStoppedTaskToScheduler: Boolean
-            get() = systemStopped
+            get() = runState.isStopped()
 
         override val isActive: Boolean
-            get() = !systemStopped
+            get() = !isTaskStopped
 
 
         override fun getInputLong(key: String, defaultValue: Long): Long {
