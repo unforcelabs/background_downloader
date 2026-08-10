@@ -906,7 +906,11 @@ object NotificationService {
                     taskWorker.appContext,
                     PermissionType.notifications
                 )
-                if (status != PermissionStatus.granted) {
+                val requiresForegroundNotification =
+                    taskWorker.runInForeground &&
+                        notificationType == NotificationType.running &&
+                        taskWorker.isActive
+                if (status != PermissionStatus.granted && !requiresForegroundNotification) {
                     return
                 }
             }
